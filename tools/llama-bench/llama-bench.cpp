@@ -28,6 +28,11 @@
 #include "llama.h"
 #include "log.h"
 
+#if defined(__linux__)
+#    include <fcntl.h>
+#    include <unistd.h>
+#endif
+
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -373,6 +378,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             drop_page_cache;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -418,9 +424,26 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* drop_page_cache      */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
+
+// best-effort eviction of the OS page cache for the given file (Linux only)
+static bool drop_page_cache(const char * fname) {
+#if defined(__linux__)
+    int fd = open(fname, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return rc == 0;
+#else
+    (void) fname;
+    return false;
+#endif
+}
 
 static void print_usage(int /* argc */, char ** argv) {
     printf("usage: %s [options]\n", argv[0]);
@@ -438,6 +461,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --drop-page-cache                           drop the OS page cache for the model file after loading\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -535,6 +559,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.drop_page_cache      = cmd_params_defaults.drop_page_cache;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1046,6 +1071,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--drop-page-cache") {
+                params.drop_page_cache = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2333,6 +2360,12 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             prev_inst = &inst;
+
+            // drop the OS page cache for the model file so that mmap-backed reads
+            // during benchmarking do not hit the page cache of a previous run
+            if (params.drop_page_cache && !drop_page_cache(inst.model.c_str())) {
+                fprintf(stderr, "%s: warning: failed to drop page cache for '%s'\n", __func__, inst.model.c_str());
+            }
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
