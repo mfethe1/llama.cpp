@@ -2352,6 +2352,14 @@ int llama_bench(int argc, char ** argv) {
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
                 llama_model_free(lmodel);
+
+                // the previous model's mmap is gone now, so the eviction below
+                // can actually reclaim its pages: the next model in the sweep
+                // (or a subsequent run of the same file) starts cold instead
+                // of page-cache warm
+                if (params.drop_page_cache && !drop_page_cache(prev_inst->model.c_str())) {
+                    fprintf(stderr, "%s: warning: failed to drop page cache for '%s'\n", __func__, prev_inst->model.c_str());
+                }
             }
 
             lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
